@@ -1,0 +1,513 @@
+---
+title: "Data Analysis for Serial Dependence in Numerosity study"
+format: html
+---
+
+```{r setup}
+library(tidyverse)
+
+library(cmdstanr)
+library(fs)
+library(ggbeeswarm)
+library(glue)
+library(loo)
+
+SAVE_FIGURES <- TRUE
+
+CI <- 0.97 # Because it is a prime number
+lower_ci <- function(values, CI = 0.97) {
+  quantile(values, (1 - CI) / 2)
+}
+
+upper_ci <- function(values, CI = 0.97) {
+  quantile(values, 1 - (1 - CI) / 2)
+}
+```
+
+
+## Data import
+
+```{r import data}
+all_results <-
+  # get names for all csv files 
+  fs::dir_ls("Data/", glob="*.csv") |>
+  
+  # load them one at a time specifying the column structure
+  purrr::map(~read_csv(., col_types = cols(
+    Participant = col_character(),
+    Session = col_character(),
+    Block = col_integer(),
+    Task = col_character(),
+    Order = col_character(),
+    Trial = col_integer(),
+    OnsetDelay = col_double(),
+    Ndots = col_integer(),
+    Color = col_character(),
+    ColorIsTarget = col_logical(),
+    ColorResponse = col_character(),
+    ColorRT = col_double(),
+    NumerosityResponse = col_double(),
+    NumerosityRT = col_double()
+  ))) |>
+  
+  # bind into a single table
+  list_rbind() |>
+  
+  # turning selected variables into factors
+  mutate(Task = factor(Task, levels = c("single", "dual")),
+         Order = factor(Order, levels = c("descending", "random", "ascending")),
+         Participant = factor(Participant)) |>
+  
+  # computing whether response on central task was correct
+  mutate(ColorTaskCorrect = (ColorIsTarget & ColorResponse == "target") | (!ColorIsTarget & ColorResponse ==  "distractor"))
+
+# Training blocks: block 1 - single central task, block 2 - single numerosity task
+results <- filter(all_results, Block > 2)
+```
+
+
+
+## Accuracy on central task
+```{r}
+central_task <-
+  results |>
+  filter(Task == "dual") |>
+  
+  # for every participant and condition, compute proportion of correct responses
+  group_by(Participant, Order) |>
+  summarise(Ncorrect = sum(ColorTaskCorrect),
+            Ntotal = n(),
+            Pcorrect = Ncorrect / Ntotal,
+            .groups = "drop") 
+
+accuracy_stan_data <- list(
+  N = nrow(central_task),
+  OrdersN = length(levels(central_task$Order)),
+  ParticipantsN = length(levels(central_task$Participant)),
+
+  Ncorrect = central_task$Ncorrect,
+  Ntotal = central_task$Ntotal,
+  Order = as.integer(central_task$Order),
+  Participant = as.integer(central_task$Participant)
+)
+
+# compile models
+acc_model_names <- c("accuracy", "accuracy-baseline")
+acc_models <- purrr::map(acc_model_names, ~cmdstan_model(glue("Stan/{.}.stan")))
+names(acc_models) <- acc_model_names
+
+# fit models
+acc_fits <- purrr::map(acc_models, ~.$sample(accuracy_stan_data, chains = 4, parallel_chains = future::availableCores()))
+names(acc_fits) <-acc_model_names
+  
+# compare models via LOO
+acc_loos <- purrr::map(acc_fits, ~.$loo())
+names(acc_loos) <- acc_model_names
+loo::loo_compare(acc_loos)
+loo::loo_model_weights(acc_loos)
+
+# extract probabilities from accuracy model
+accuracy_p <-
+  acc_fits[['accuracy']]$draws(format = "df") |>
+  as_tibble() |>
+  select(.chain, .draw, starts_with("mu")) |>
+  pivot_longer(starts_with("mu"), names_to = "Order", values_to = "mu") |>
+  mutate(Order = factor(str_extract(Order, "\\d"), labels = levels(central_task$Order)),
+         Pcorrect = boot::inv.logit(mu)) |>
+  select(-mu)
+
+accuracy_diff <-
+  accuracy_p |>
+  pivot_wider(names_from = Order, values_from = Pcorrect) |>
+  mutate(`random - ascending` = random - ascending,
+         `descending - random` = descending - random,
+         `descending - ascending` = descending - ascending) |>
+  select(-random, -ascending, -descending) |>
+  pivot_longer(`random - ascending`:`descending - ascending`, names_to = "Comparison", values_to = "Difference") |>
+  group_by(Comparison) |>
+  summarise(Avg = mean(Difference),
+            AboveZero = mean(Difference > 0),
+            LowerCI = lower_ci(Difference),
+            UpperCI = upper_ci(Difference),
+            .groups = "drop") |>
+  mutate(First = str_sub(Comparison, 1, 1) |> str_to_upper(),
+         Second = str_extract(Comparison, "(?<=- )[a-z]") |> str_to_upper()) |>
+  mutate(Difference = sprintf("%s > %s: %.1f%%\n%s-%s = %.2f [%.2f..%.2f]", First, Second, 100 * AboveZero, First, Second, Avg, LowerCI, UpperCI))
+
+ggplot(central_task, aes(x = as.integer(Order), y = 100 * Pcorrect)) +
+  geom_violin(data = accuracy_p, aes(color = Order, fill = Order), alpha = 0.5) +
+  geom_quasirandom(method = "tukeyDense", width = 0.2) +
+  geom_segment(x = 1.1, xend = 1.9, y = 60, yend = 60) +
+  geom_label(x = 1.5, y = 60, label= accuracy_diff$Difference[accuracy_diff$Comparison == "descending - random"]) +
+  geom_segment(x = 2.1, xend = 2.9, y = 60, yend = 60) +
+  geom_label(x = 2.5, y = 60, label= accuracy_diff$Difference[accuracy_diff$Comparison == "random - ascending"]) +
+  geom_segment(x = 1.1, xend = 2.9, y = 70, yend = 70) +
+  geom_label(x = 2, y = 70, label= accuracy_diff$Difference[accuracy_diff$Comparison == "descending - ascending"]) +
+  theme(legend.position =  "None") +
+  scale_x_continuous(name = "Order", breaks = 1:3, labels = str_to_title(levels(results$Order))) +
+  ylab("Accuracy [%]")
+
+if (SAVE_FIGURES) {
+  ggsave("Figures/accuracy.png", units = "cm", width = 16, height = 10)
+  ggsave("Figures/accuracy.svg", units = "cm", width = 16, height = 10)
+}
+```
+
+
+## Numerosity reponse per condition
+
+```{r compute geomean}
+compute_average_numerosity <- function(df, iteration = NULL, resample = FALSE) {
+  if (resample) df <- slice_sample(df, prop = 1, replace = TRUE)
+
+  df |>
+    group_by(Participant, Task, Order, Ndots) |>
+    summarise(ParticipantAvg = mean(NumerosityResponse), .groups = "drop") |>
+    group_by(Task, Order, Ndots) |>
+    summarise(AvgNumerosity = mean(ParticipantAvg), .groups = "drop") |>
+    mutate(Iteration = iteration)
+}
+
+# sample geometric group-level mean
+numerosity_avg <- compute_average_numerosity(filter(results, Order != "color"))
+
+# bootstrapped samples
+numerosity_samples <- purrr::map(1:2000,
+                                 ~compute_average_numerosity(filter(results, Order != "color"), iteration = ., resample = TRUE),
+                                 .progress = TRUE) |> list_rbind()
+
+# percentile confidence intervals
+numerosity_ci <-
+  numerosity_samples |>
+  group_by(Task, Order, Ndots) |>
+  summarise(LowerCI = lower_ci(AvgNumerosity),
+            UpperCI = upper_ci(AvgNumerosity),
+            .groups = "drop")
+
+# joining sample averages with confidence intervals into a single table
+numerosity_summary <- left_join(numerosity_avg, numerosity_ci, by = c("Task", "Order", "Ndots"))
+
+# plotting summary statistic for up to 4 color repetitions
+ggplot(numerosity_summary, aes(x = Ndots, y = 100 * AvgNumerosity, color = Task)) +
+  geom_abline(linetype = "dashed") +
+  geom_smooth(method = lm, formula = y ~ splines::bs(x, 3), se = FALSE) +
+  geom_errorbar(aes(ymin = 100 * LowerCI, ymax = 100 * UpperCI)) +
+  geom_point() +
+  facet_grid(.~Order) +
+  xlab("Number of dots") +
+  ylab("Average numerosity response")
+
+ggplot(mutate(numerosity_summary, Order = fct_relevel(Order, "descending")),
+              aes(x = Ndots, y = 100 * AvgNumerosity, color = Order)) +
+  geom_abline(linetype = "dashed") +
+  geom_smooth(method = lm, formula = y ~ splines::bs(x, 3), se = FALSE) +
+  geom_errorbar(aes(ymin = 100 * LowerCI, ymax = 100 * UpperCI)) +
+  geom_point() +
+  facet_grid(.~Task) +
+  xlab("Number of dots") +
+  ylab("Average numerosity response") +
+  xlim(0, 100) +
+  ylim(0, 100) +
+  coord_equal()
+
+# if (SAVE_FIGURES) {
+#   ggsave("Figures/results.png", units = "cm", width = 16, height = 8)
+#   ggsave("Figures/results.svg", units = "cm", width = 16, height = 8)
+# }
+```
+
+
+
+
+## Statistical models
+
+### Understanding Wprev
+
+```{r}
+alpha <- 0.36
+k <- 6.3
+
+N <- sort(unique(results$Ndots))
+wprev <-
+  expand_grid(Ni = 1:max(N), Ni1 = N) |>
+  mutate(Wprev = (k^2 * Ni^(2 * alpha)) / ( (k^2 * Ni^(2 * alpha))  + (k^2 * Ni1^(2 * alpha))  + (Ni - Ni1)^2)) 
+
+w_avg <-
+  wprev |>
+  group_by(Ni) |>
+  summarise(Avg = mean(Wprev), .groups = "drop")
+
+ggplot(wprev, aes(x = Ni, y = Wprev, color = as.factor(Ni1))) +
+  geom_line() +
+  geom_line(data = w_avg, aes(y = Avg), color = "black") +
+  guides(color = guide_legend(title = "Ni-1"))
+```
+
+
+### Mixed linear logarithmic model
+
+Following equation (1) in Cicchinia, Anobileb, and Burr (2014), we extended it to a multilevel model with weakly regularizing priors. $\alpha_{TP}$ and $\lamda_{TP}$ refer to value for task $T_i$ and participant $P_i$.
+
+$$R_i \sim Normal(\mu_i, k_T \cdot N_i^{\alpha_T})$$
+$$\mu_i = \alpha_i\left((1 - \lambda_i)N_i + \lambda_i \frac{N_{max}}{ln(N_{max})} ln(N_i)\right) $$
+$$logit(\alpha_i) = \mu_\alpha[Task_i] +  \sigma_\alpha[Task_i] \cdot Z_\alpha[Participant_i]$$
+
+$$\mu_\alpha \sim Normal(logit(0.8), 0.5)$$
+$$\sigma_\alpha \sim Exponential(1)$$
+$$Z_\alpha \sim Normal(0, 1)$$
+$$logit(\lambda_i) = \mu_\lambda[Task_i] +  \sigma_\lambda[Task_i] \cdot Z_\lambda[Participant_i]$$
+$$\mu_\lambda \sim Normal(logit(0.8), 0.5)$$
+$$\sigma_\lambda \sim Exponential(1)$$
+$$Z_\lambda \sim Normal(0, 1)$$
+
+$$a_T \sim Exponential(1)$$
+$$k_T \sim Exponential(1)$$
+where in our experiment $N_max = 100$.
+
+
+### Bayesian Integration Model
+
+$$R_i \sim Normal(\mu_i, k_T \cdot N_i^{\alpha_T})$$
+$$\begin{equation}
+  \mu_i =
+  \begin{cases}
+    N_i & Trial_i = 1 \\
+    (1 - W_{i-1}) N_i + W_{i-1} R_{i-1} & Trial_i > 1 \\
+  \end{cases}
+  \end{equation}$$
+
+
+$$W_{i-1} = \frac{k_T^2N_i^{2\alpha_T}}{k_T^2N_i^{2\alpha_T} + k_T^2N_{i-1}^{2\alpha_T} + (N_i - R_{i-1})^2}$$
+$$a_T \sim Exponential(1)$$
+$$k_T \sim Exponential(1)$$
+
+### Preparing data for statistical models
+
+```{r}
+results <- 
+  arrange(results, Participant, Session, Block, Trial) |>
+  mutate(Numerosity = factor(Ndots))
+
+stan_data <- list(
+  N = nrow(results),
+  TaskN = 2,
+  ParticipantsN = length(levels(results$Participant)),
+  Nmax = 100,
+  LevelsN = length(levels(results$Numerosity)),
+  NumerosityLevel = as.numeric(as.character(levels(results$Numerosity))),
+  
+  DotsN = results$Ndots,
+  Level = as.integer(results$Numerosity),
+  Trial = results$Trial,
+  Response = results$NumerosityResponse * 100,
+  Task = as.integer(results$Task),
+  Participant = as.integer(results$Participant)
+)
+
+saveRDS(stan_data, "data4stan.RDS")
+```
+
+### Fitting models
+```{r}
+#|echo: false
+model_names <- c("linear_log_cov", "bayesian_integration_cov", "bayesian_integration_interval", "bayesian_integration_interval_error", "bayesian_integration_interval_error_distance", "bayesian_integration_interval_error_memory")
+models <- purrr::map(model_names, ~cmdstan_model(glue("Stan/{.}.stan")))
+names(models) <- model_names
+```
+
+
+```{r}
+for(a_model in model_names[5]) {
+  print(a_model)
+  fit <- models[[a_model]]$sample(stan_data, chains = 4, parallel_chains = future::availableCores())
+  
+  fit_loo <- fit$loo(cores = 2)
+  saveRDS(fit_loo, glue("Models/LOOs/loo-{a_model}.RDS"))
+  
+  draws <- fit$draws(format = "df") |> as_tibble() |> select(-starts_with("log_lik"))
+  saveRDS(draws, glue("Models/Draws/draws-{a_model}.RDS"))
+}
+```
+
+### Comparing modes via LOO
+
+```{r}
+loos <- purrr::map(model_names[1:4], ~readRDS(glue("Models/LOOs/loo-{.}.RDS")))
+names(loos) <- model_names[1:4]
+loo::loo_compare(loos)
+loo::loo_model_weights(loos)
+```
+
+### Aggretate predictions
+```{r}
+compute_predicted_numerosity <- function(df, Npredicted, iteration = NULL) {
+  df |>
+    add_column(Npred = Npredicted) |>
+    group_by(Participant, Task, Order, Ndots) |>
+    summarise(ParticipantAvg = mean(Npred), .groups = "drop") |>
+    group_by(Task, Order, Ndots) |>
+    summarise(AvgNumerosity = mean(ParticipantAvg), .groups = "drop") |>
+    mutate(Iteration = iteration)
+}
+
+for(a_model in model_names[2:4]){
+  mu <- readRDS(glue("Models/Draws/draws-{a_model}.RDS")) |> select(starts_with("mu["))
+  
+  prediction_samples <- purrr::map(1:200, ~compute_predicted_numerosity(results, as.numeric(mu[., ]), .), .progress = TRUE) |> list_rbind()
+  saveRDS(prediction_samples, glue("Models/Predictions/samples-{a_model}.RDS"))
+  
+  prediction_avg <-
+    prediction_samples |>
+  group_by(Task, Order, Ndots) |>
+  summarise(Avg = mean(AvgNumerosity),
+            LowerCI = lower_ci(AvgNumerosity),
+            UpperCI = upper_ci(AvgNumerosity),
+            .groups = "drop")
+
+  saveRDS(prediction_avg, glue("Models/Predictions/avg-{a_model}.RDS"))
+}
+```
+
+```{r}
+
+model_names <- c("linear_log_cov", "bayesian_integration_cov", "bayesian_integration_interval_error_logdistance")
+for(a_model in model_names){
+  prediction_avg <- readRDS(glue("Models/Predictions/avg-{a_model}.RDS"))
+  
+  
+  # plotting summary statistic for up to 4 color repetitions
+  ggplot(numerosity_summary, aes(x = Ndots, y = 100 * AvgNumerosity, color = Task)) +
+    geom_abline(linetype = "dashed") +
+    geom_ribbon(data = mutate(prediction_avg, Order = fct_relevel(Order, "descending")),
+            aes(y = Avg, ymin = LowerCI, ymax = UpperCI, fill = Task), color = NA, alpha = 0.75) +
+    geom_errorbar(aes(ymin = 100 * LowerCI, ymax = 100 * UpperCI)) +
+    geom_point() +
+    facet_grid(.~Order) +
+    xlab("Number of dots") +
+    ylab("Average numerosity response")
+
+  ggsave(glue("Figures/{a_model}-alt.png"), units = "cm", width = 16, height = 8)
+  ggsave(glue("Figures/{a_model}-alt.svg"), units = "cm", width = 16, height = 8)
+  
+  ggplot(mutate(numerosity_summary, Order = fct_relevel(Order, "descending")),
+         aes(x = Ndots, y = 100 * AvgNumerosity, color = Order)) +
+    geom_abline(linetype = "dashed") +
+    geom_ribbon(data = mutate(prediction_avg, Order = fct_relevel(Order, "descending")),
+                aes(y = Avg, ymin = LowerCI, ymax = UpperCI, fill = Order), color = NA, alpha = 0.75) +  
+    geom_errorbar(aes(ymin = 100 * LowerCI, ymax = 100 * UpperCI)) +
+    geom_point() +
+    facet_grid(.~Task) +
+    xlab("Number of dots") +
+    ylab("Average numerosity response") +
+    xlim(0, 100) +
+    ylim(0, 100) +
+    coord_equal()
+  
+  ggsave(glue("Figures/{a_model}.png"), units = "cm", width = 16, height = 8)
+  ggsave(glue("Figures/{a_model}.svg"), units = "cm", width = 16, height = 8)
+}
+```
+
+## Posterior for error logdistance model
+
+```{r}
+draws <- readRDS("Models/Draws/draws-bayesian_integration_interval_error_logdistance.RDS")
+
+params <-
+  draws |>
+  select(.chain, .draw, starts_with("mu_wmax_betaab_lambda")) |>
+  pivot_longer(starts_with("mu_wmax_betaab_lambda"), names_to = "Name", values_to = "Value") |>
+  mutate(iTerm = as.integer(str_extract(Name, "\\d")),
+         Term = case_when(iTerm %in% c(1, 2) ~ "Wmax",
+                          iTerm %in% c(3, 4) ~ "A",
+                          iTerm %in% c(5, 6) ~ "B",
+                          iTerm %in% c(7, 8) ~ "lambda"),
+         Task = case_when(iTerm %in% c(1, 3, 5, 7) ~ "Single",
+                          iTerm %in% c(2, 4, 6, 8) ~ "Dual")) |>
+  select(-Name, -iTerm)
+
+pticks <- seq(0.001, 0.999, length.out = 100)
+
+beta_params <-
+  params |>
+  filter(Term %in% c("A", "B", "Wmax")) |>
+  mutate(Value = case_when(Term %in% c("A", "B") ~ 1 + exp(Value),
+                           Term == "Wmax" ~ boot::inv.logit(Value))) |>
+  pivot_wider(names_from = Term, values_from = Value) |>
+  mutate(Mode = (A - 1) / (A + B - 2),
+         Unorm = dbeta(Mode, A, B))
+
+uncertainty <-
+  beta_params |>
+  group_by(.chain, .draw, Task) |>
+  group_modify(~tibble(P = pticks, U = .x$Wmax[1] * dbeta(pticks, .x$A[1], .x$B[1]) / .x$Unorm[1])) 
+
+uncertainty_avg <- 
+  uncertainty |>
+  group_by(Task, P) |>
+  summarise(AvgU = mean(U),
+            LowerCI = lower_ci(U),
+            UpperCI = upper_ci(U),
+            .groups = "drop")
+
+
+uncertainty |>
+  pivot_wider(names_from = Task, values_from = U) |>
+  mutate(Delta = Dual - Single) |>
+  group_by(P) |>
+  summarise(Summary = sprintf("%.2f [%.2f..%.2f]", mean(Delta), lower_ci(Delta), upper_ci(Delta)), .groups = "drop")
+  
+
+ggplot(uncertainty_avg, aes(x = P * 100, y = AvgU, color = Task)) +
+  geom_ribbon(aes(ymin = LowerCI, ymax = UpperCI, fill = Task), color = NA, alpha = 0.35) +
+  geom_line() +
+  scale_x_continuous(name = "Numerosity") +
+  scale_y_continuous(name = "Uncertainty")
+
+ggsave("Figures/uncertainty.png", units = "cm", width = 12, height = 8)
+ggsave("Figures/uncertainty.svg", units = "cm", width = 12, height = 8)
+```
+
+
+```{r}
+wmax <-
+  params |>
+  filter(Term %in% "Wmax") |>
+  select(-Term) |>
+  mutate(Value = boot::inv.logit(Value))
+
+# wmax_difference <-
+  wmax |>
+  pivot_wider(names_from = Task, values_from = Value) |>
+  summarise(Difference = sprintf("%.2f [%.2f..%.2f], D>S %.1f%%", mean(Dual - Single), lower_ci(Dual - Single), upper_ci(Dual - Single), 100 * mean((Dual - Single) > 0)), 
+            .groups = "drop")
+  
+ggplot(wmax, aes(x = Value, fill = Task)) +
+  geom_histogram(bins = 100, position = "identity", alpha = 0.35, aes(y = after_stat(count)/ sum(after_stat(count))))  +
+  scale_x_continuous(name = "Maximal weight of prior evidence") +
+  scale_y_continuous(name = "PDF")
+ggsave("Figures/wmax.png", units = "cm", width = 12, height = 8)
+ggsave("Figures/wmax.svg", units = "cm", width = 12, height = 8)
+```
+
+
+```{r}
+lambda <-
+  params |>
+  filter(Term %in% "lambda") |>
+  select(-Term) |>
+  mutate(Value = exp(Value))
+
+# wmax_difference <-
+  lambda |>
+  pivot_wider(names_from = Task, values_from = Value) |>
+  summarise(Difference = sprintf("%.2f [%.2f..%.2f], D>S %.1f%%", mean(Dual - Single), lower_ci(Dual - Single), upper_ci(Dual - Single), 100 * mean((Dual - Single) > 0)), 
+            .groups = "drop")
+  
+ggplot(lambda, aes(x = Value, fill = Task)) +
+  geom_histogram(bins = 100, position = "identity", alpha = 0.35, aes(y = after_stat(count)/ sum(after_stat(count))))  +
+  scale_x_continuous(name = "Scale for distance to prior evidence", limits = c(0, 40)) +
+  scale_y_continuous(name = "PDF")
+ggsave("Figures/lambda.png", units = "cm", width = 12, height = 8)
+ggsave("Figures/lambda.svg", units = "cm", width = 12, height = 8)
+```
