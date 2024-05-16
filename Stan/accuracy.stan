@@ -28,3 +28,9 @@ model {
 
   for(i in 1:N) Ncorrect[i] ~ binomial(Ntotal[i], p[Order[i], Participant[i]]);
 }
+
+generated quantities {
+  vector[N] log_lik;
+  
+  for(i in 1:N) log_lik[i] = binomial_lpmf(Ncorrect[i] | Ntotal[i], p[Order[i], Participant[i]]);
+}
